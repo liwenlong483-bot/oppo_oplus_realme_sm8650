@@ -96,6 +96,16 @@ on:
         required: false
         type: string
         default: ''
+      nomount_enable:
+        description: '是否启用 NoMount 模块支持'
+        required: true
+        type: boolean
+        default: 'false'
+      adios_enable:
+        description: '是否启用 Adios 相关补丁'
+        required: true
+        type: boolean
+        default: 'false'
 
 jobs:
   build:
@@ -121,10 +131,7 @@ jobs:
           sudo rm -rf /var/lib/man-db/auto-update &&
           sudo apt update &&
           sudo apt-get install -y --no-install-recommends binutils python-is-python3 libssl-dev libelf-dev &
-          #旧版完整指令：（由于经过验证大部分指令已内置于GitHub Action环境中，故进行精简）
-          #sudo apt-get install -y --no-install-recommends curl bison flex make binutils git perl gcc python3 python-is-python3 bc libssl-dev libelf-dev zip unzip ccache
           
-          #使用最新版ccache-ECS（特化优化内核编译缓存，大幅提升二次不同配置编译速度）
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/lib/ccache-x86-64 -O ccache &&
           sudo cp -f ./ccache /usr/bin/ccache &&
           sudo chmod +x /usr/bin/ccache &&
@@ -150,15 +157,12 @@ jobs:
           wait
           echo "所有源码及llvm-Clang20工具链下载解压完成，正在前台应用一加 OKI 树补丁并校验..."
           cd common
-          # 1. 移除 block/blk-mq.c 中多余导出的 test_task_ux 符号，防止与 vendor_boot 首阶段模块 oplus_bsp_sched_assist.ko 产生重复符号/CRC 冲突导致开机无限重启 (OnePlusOSS/android_kernel_common_oneplus_sm8650#35)
           sed -i '/EXPORT_SYMBOL_GPL(test_task_ux);/d' block/blk-mq.c
           if grep -q "EXPORT_SYMBOL_GPL(test_task_ux)" block/blk-mq.c; then
             echo "错误：未能移除 block/blk-mq.c 中的 EXPORT_SYMBOL_GPL(test_task_ux)！"
             exit 1
           fi
-          # 1.5 修复 6.1.157 Nord 5 源码中 task_struct 的 KABI 槽位偏移错位问题 (CONFIG_SLIM_SCHED 将 dmabuf_info 从 slot 2 挤到 slot 4 导致开机无限重启，需将 dmabuf_info 固定在 slot 2，sched_prop/scx 移至 slot 3/4)
           python3 -c 'p="include/linux/sched.h"; s=open(p,encoding="utf-8").read(); old="\tANDROID_KABI_USE(1, unsigned int saved_state);\n#ifdef CONFIG_SLIM_SCHED\n\tANDROID_KABI_USE(2, unsigned long sched_prop);\n\tANDROID_KABI_USE(3, struct sched_ext_entity *scx);\n\tANDROID_KABI_USE(4, struct task_dma_buf_info *dmabuf_info);\n#else\n\tANDROID_KABI_USE(2, struct task_dma_buf_info *dmabuf_info);\n\tANDROID_KABI_RESERVE(3);\n\tANDROID_KABI_RESERVE(4);\n#endif"; new="\tANDROID_KABI_USE(1, unsigned int saved_state);\n\tANDROID_KABI_USE(2, struct task_dma_buf_info *dmabuf_info);\n#ifdef CONFIG_SLIM_SCHED\n\tANDROID_KABI_USE(3, unsigned long sched_prop);\n\tANDROID_KABI_USE(4, struct sched_ext_entity *scx);\n#else\n\tANDROID_KABI_RESERVE(3);\n\tANDROID_KABI_RESERVE(4);\n#endif"; assert old in s, "sched.h KABI pattern not found!"; open(p,"w",encoding="utf-8").write(s.replace(old,new,1))'
-          # 2. 移除 6 个指向外部 vendor 目录的悬空软链接，并剔除 1c9edfd50d2a.patch 中的 deleted file mode 120000 块后完整打入补丁，随后同步 6.1.157 (sm8635) 最新更新的 7 个 oplus_cpu 文件
           rm -rf drivers/soc/oplus/oplus_resctrl drivers/soc/oplus/storage kernel/locking/locking_main.h kernel/locking/oplus_locking.c kernel/locking/sa_common_struct.h kernel/oplus_cpu
           wget -q https://github.com/cctv18/android_kernel_common_oneplus_sm8650/commit/1c9edfd50d2a.patch
           python3 -c 'import re; p=open("1c9edfd50d2a.patch",encoding="utf-8").read(); p=re.sub(r"diff --git a/[^\n]+\ndeleted file mode 120000\n.*?(?=\ndiff --git |\Z)","",p,flags=re.S); open("1c9edfd50d2a.patch","w",encoding="utf-8").write(p)'
@@ -251,7 +255,6 @@ jobs:
       
       - name: 初始化并配置ccache
         run: |
-          # 设置ccache环境变量
           export CCACHE_COMPILERCHECK="none"
           export CCACHE_BASEDIR="${{ github.workspace }}"
           export CCACHE_NOHASHDIR="true"
@@ -259,19 +262,15 @@ jobs:
           export CCACHE_DIR="${{ env.CCACHE_DIR }}"
           export CCACHE_MAXSIZE="${{ env.CCACHE_MAXSIZE }}"
           
-          # 确保ccache目录存在
           mkdir -p "$CCACHE_DIR"
           
-          # 每次运行都重新配置缓存大小
           echo "配置ccache缓存大小为: $CCACHE_MAXSIZE"
           ccache -M "$CCACHE_MAXSIZE"
           ccache -o compression=true
           
-          # 显示初始缓存状态
           echo "ccache初始状态:"
           ccache -s
           
-          # 如果缓存恢复命中，显示详细信息
           if [ "${{ steps.ccache-restore.outputs.cache-hit }}" == 'true' ]; then
             echo "ccache缓存命中详情:"
             ccache -sv
@@ -280,16 +279,21 @@ jobs:
       - name: 添加KernelSU
         id: ksu_version
         run: |
-          # 进入内核工作目录
           cd kernel_workspace
-          if [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
-            echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
+          if [[ ${{ github.event.inputs.ksu_type }} == "bakasu-main-dev" ]]; then
+            echo "正在配置BakaSU main-dev..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
-            # 生成自定义版本号（基于提交计数）, 失败时使用 114514
             KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
-            # 存储版本号到 GitHub 环境变量
+            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+          elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu-sync-up" ]]; then
+            echo "正在配置BakaSU sync-up..."
+            curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/sync-up/kernel/setup.sh" | bash -s sync-up
+            echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
+            cd ./KernelSU
+            KSU_VERSION=$(expr $(git rev-list --count sync-up) + 30700 2>/dev/null || echo 114514)
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
           elif [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
@@ -312,7 +316,6 @@ jobs:
             sed -i "s/KSU_VERSION_FALLBACK := 1/KSU_VERSION_FALLBACK := $KSU_VERSION/g" kernel/Kbuild
             KSU_GIT_TAG=$(curl -sL "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/tags" | grep -o '"name": *"[^"]*"' | head -n 1 | sed 's/"name": "//;s/"//')
             sed -i "s/KSU_VERSION_TAG_FALLBACK := v0.0.1/KSU_VERSION_TAG_FALLBACK := $KSU_GIT_TAG/g" kernel/Kbuild
-            #为KernelSU Next添加WildKSU管理器支持
             cd ../common/drivers/kernelsu
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/apk_sign.patch
             patch -p2 -N -F 3 < apk_sign.patch || true
@@ -328,7 +331,8 @@ jobs:
             echo "已选择无内置KernelSU模式，跳过KernelSU配置..."
           fi
 
-       - name: 默认启用 SELinux 隐藏
+      - name: 默认启用 SELinux 隐藏
+        if: inputs.ksu_type != 'none'
         run: |
           cd kernel_workspace
           python3 - <<'PY'
@@ -350,7 +354,9 @@ jobs:
               open(p, 'w').write(s)
           PY
           grep -n 'auto-enable' common/drivers/kernelsu/feature/selinux_hide.c
+
       - name: 对齐 SELinux access/status seqno
+        if: inputs.ksu_type != 'none'
         run: |
           cd kernel_workspace
           python3 - <<'PY'
@@ -386,46 +392,39 @@ jobs:
           PY
           grep -R '^KSU_VERSION' common/drivers/kernelsu/Kbuild common/drivers/kernelsu/Makefile 2>/dev/null | head
 
-
       - name: 应用 KernelSU & SUSFS 补丁
-        if: inputs.susfs_enable
+        if: inputs.susfs_enable && inputs.ksu_type != 'none'
         run: |
           cd kernel_workspace
-          if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
-            echo "正在添加susfs补丁..."
-            if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
-              git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-            else
-              git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-              git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu_upstream -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
-              cp ./susfs4ksu_upstream/kernel_patches/fs/* ./susfs4ksu/kernel_patches/fs/
-              cp ./susfs4ksu_upstream/kernel_patches/include/linux/* ./susfs4ksu/kernel_patches/include/linux/
-            fi
-            wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
-            cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
-            cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
-            cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
-            cd ./common
-            if [[ ${{ github.event.inputs.ksu_type }} != "bakasu-sync-up" ]]; then
-              # 6.1.157 在 fs/namespace.c 的 #include "internal.h" 后新增了 #include <trace/hooks/blk.h>，cctv18/susfs4oki 需先临时移除以确保 SUSFS Hunk #1 完整打入，再恢复该头文件
-              sed -i '/#include <trace\/hooks\/blk.h>/d' fs/namespace.c
-              patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
-              sed -i '/#include "internal.h"/a #include <trace/hooks/blk.h>' fs/namespace.c
-              # 为非 sync-up 分支同步打入 block/ioprio.c 与 kernel/sys.c 的 CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER 补丁块
-              python3 -c 'import pathlib; p=pathlib.Path("block/ioprio.c"); s=p.read_text(); p.write_text(s.replace("SYSCALL_DEFINE3(ioprio_set,", "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\nextern bool susfs_is_priority_uid_filtered(uid_t uid);\n#endif\n\nSYSCALL_DEFINE3(ioprio_set,", 1).replace("\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse\n\t\t\t\tuser = find_user(uid);", "\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse {\n#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n\t\t\t\tif (current_uid().val >= 10000 && susfs_is_priority_uid_filtered(uid.val))\n\t\t\t\t\tbreak;\n#endif\n\t\t\t\tuser = find_user(uid);\n\t\t\t}", 2)) if "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER" not in s else None; p2=pathlib.Path("kernel/sys.c"); s2=p2.read_text(); p2.write_text(s2.replace("SYSCALL_DEFINE3(setpriority,", "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\nextern bool susfs_is_priority_uid_filtered(uid_t uid);\n#endif\n\nSYSCALL_DEFINE3(setpriority,", 1).replace("\t\tif (!who)\n\t\t\tuid = cred->uid;\n\t\telse if (!uid_eq(uid, cred->uid)) {\n\t\t\tuser = find_user(uid);", "\t\tif (!who)\n\t\t\tuid = cred->uid;\n\t\telse if (!uid_eq(uid, cred->uid)) {\n#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n\t\t\tif (cred->uid.val >= 10000 && susfs_is_priority_uid_filtered(uid.val))\n\t\t\t\tgoto out_unlock;\n#endif\n\t\t\tuser = find_user(uid);", 2)) if "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER" not in s2 else None'
-            else
-              patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
-            fi
-            patch -p1 -N -F 3 < 69_hide_stuff.patch
-            for f in net/unix/af_unix.c fs/susfs.c fs/readdir.c fs/stat.c fs/open.c kernel/sys.c block/ioprio.c; do
-              sed -i '1i // CI_RUN_ID: ${{ github.run_id }}\n// ccache:disable' "$f"
-            done
-            grep -q "susfs_is_current_app_uid" net/unix/af_unix.c || { echo "错误：af_unix.c 隐藏补丁未生效！"; exit 1; }
-            grep -q "ksu_is_manager_uid" fs/susfs.c || { echo "错误：susfs.c 管理器UID自动隐藏补丁未生效！"; exit 1; }
-            cd ..
+          echo "正在添加susfs补丁..."
+          if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
           else
-            echo "已选择无内置KernelSU模式，跳过susfs配置..."
+            git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu_upstream -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
+            cp ./susfs4ksu_upstream/kernel_patches/fs/* ./susfs4ksu/kernel_patches/fs/
+            cp ./susfs4ksu_upstream/kernel_patches/include/linux/* ./susfs4ksu/kernel_patches/include/linux/
           fi
+          wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/69_hide_stuff.patch -O ./common/69_hide_stuff.patch
+          cp ./susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch ./common/
+          cp ./susfs4ksu/kernel_patches/fs/* ./common/fs/
+          cp ./susfs4ksu/kernel_patches/include/linux/* ./common/include/linux/
+          cd ./common
+          if [[ ${{ github.event.inputs.ksu_type }} != "bakasu-sync-up" ]]; then
+            sed -i '/#include <trace\/hooks\/blk.h>/d' fs/namespace.c
+            patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+            sed -i '/#include "internal.h"/a #include <trace/hooks/blk.h>' fs/namespace.c
+            python3 -c 'import pathlib; p=pathlib.Path("block/ioprio.c"); s=p.read_text(); p.write_text(s.replace("SYSCALL_DEFINE3(ioprio_set,", "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\nextern bool susfs_is_priority_uid_filtered(uid_t uid);\n#endif\n\nSYSCALL_DEFINE3(ioprio_set,", 1).replace("\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse\n\t\t\t\tuser = find_user(uid);", "\t\t\tif (!who)\n\t\t\t\tuser = current_user();\n\t\t\telse {\n#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n\t\t\t\tif (current_uid().val >= 10000 && susfs_is_priority_uid_filtered(uid.val))\n\t\t\t\t\tbreak;\n#endif\n\t\t\t\tuser = find_user(uid);\n\t\t\t}", 2)) if "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER" not in s else None; p2=pathlib.Path("kernel/sys.c"); s2=p2.read_text(); p2.write_text(s2.replace("SYSCALL_DEFINE3(setpriority,", "#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\nextern bool susfs_is_priority_uid_filtered(uid_t uid);\n#endif\n\nSYSCALL_DEFINE3(setpriority,", 1).replace("\t\tif (!who)\n\t\t\tuid = cred->uid;\n\t\telse if (!uid_eq(uid, cred->uid)) {\n\t\t\tuser = find_user(uid);", "\t\tif (!who)\n\t\t\tuid = cred->uid;\n\t\telse if (!uid_eq(uid, cred->uid)) {\n#ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n\t\t\tif (cred->uid.val >= 10000 && susfs_is_priority_uid_filtered(uid.val))\n\t\t\t\tgoto out_unlock;\n#endif\n\t\t\tuser = find_user(uid);", 2)) if "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER" not in s2 else None'
+          else
+            patch -p1 -F 3 < 50_add_susfs_in_gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
+          fi
+          patch -p1 -N -F 3 < 69_hide_stuff.patch
+          for f in net/unix/af_unix.c fs/susfs.c fs/readdir.c fs/stat.c fs/open.c kernel/sys.c block/ioprio.c; do
+            sed -i '1i // CI_RUN_ID: ${{ github.run_id }}\n// ccache:disable' "$f"
+          done
+          grep -q "susfs_is_current_app_uid" net/unix/af_unix.c || { echo "错误：af_unix.c 隐藏补丁未生效！"; exit 1; }
+          grep -q "ksu_is_manager_uid" fs/susfs.c || { echo "错误：susfs.c 管理器UID自动隐藏补丁未生效！"; exit 1; }
+          cd ..
           if [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
             echo "正在为原版 KernelSU (tiann/KernelSU)添加补丁..."
             cp ./susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ./KernelSU/
@@ -433,13 +432,12 @@ jobs:
             patch -p1 -F 3 < 10_enable_susfs_for_ksu.patch || true
           fi
 
-     - name: 隐藏 SELinux policy dump
+      - name: 隐藏 SELinux policy dump
         if: inputs.susfs_enable && inputs.ksu_type != 'none'
         run: |
           cd kernel_workspace
           python3 - <<'PY'
           import os
-          # 1) 在 services.c 暴露一个“按指定 policy 序列化”的 helper
           svc = 'common/security/selinux/ss/services.c'
           s = open(svc).read()
           if 'security_read_policy_from' not in s:
@@ -468,7 +466,6 @@ jobs:
               )
               s = s.replace(marker, helper + marker, 1)
               open(svc, 'w').write(s)
-          # 2) selinuxfs 打开 policy 时，普通应用改用 backup policy
           fs = 'common/security/selinux/selinuxfs.c'
           s = open(fs).read()
           if 'ksu_selinux_hide_is_running' not in s:
@@ -504,7 +501,6 @@ jobs:
               )
               s = s.replace('\t' + old, new, 1)
               open(fs, 'w').write(s)
-          # 3) 暴露 hide running 状态
           hide = 'common/drivers/kernelsu/feature/selinux_hide.c'
           s = open(hide).read()
           if 'ksu_selinux_hide_is_running' not in s:
@@ -544,7 +540,7 @@ jobs:
           patch -p1 -F 3 < lz4kd.patch || true
           
       - name: 添加SUSFS 配置项
-        if: inputs.susfs_enable
+        if: inputs.susfs_enable && inputs.ksu_type != 'none'
         run: |
           cd kernel_workspace
           echo "CONFIG_KSU_SUSFS=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -567,11 +563,12 @@ jobs:
       - name: 添加 KSU & 其他配置项
         run: |
           cd kernel_workspace
-          echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+          if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
+            echo "CONFIG_KSU=y" >> ./common/arch/arm64/configs/gki_defconfig
+          fi
           if [[ "${{ github.event.inputs.susfs_enable }}" == "false" ]]; then
             echo "CONFIG_KSU_SUSFS=n" >> ./common/arch/arm64/configs/gki_defconfig
           fi
-          #添加对 Mountify (backslashxx/mountify) 模块的支持
           echo "CONFIG_TMPFS_XATTR=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_TMPFS_POSIX_ACL=y" >> ./common/arch/arm64/configs/gki_defconfig
           if [[ ${{ github.event.inputs.lz4kd_enable }} == 'true' ]]; then
@@ -581,15 +578,11 @@ jobs:
             echo "CONFIG_CRYPTO_LZ4KD=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_CRYPTO_842=y" >> ./common/arch/arm64/configs/gki_defconfig
           fi
-          # 开启O2编译优化配置
           echo "CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE=y" >> ./common/arch/arm64/configs/gki_defconfig
-          #禁用 defconfig 检查
           sed -i 's/check_defconfig//' ./common/build.config.gki
-          # sync-up 分支的 preinit_runner.mk 需要依赖 usr/include 下的 UAPI 头文件，仅非 sync-up 分支关闭 CONFIG_HEADERS_INSTALL
           if [[ "${{ github.event.inputs.ksu_type }}" != "bakasu-sync-up" ]]; then
             echo "CONFIG_HEADERS_INSTALL=n" >> ./common/arch/arm64/configs/gki_defconfig
           fi
-          # 应用 CVE_2026_43499 修复补丁 (6.1.157 上游已内置此修复，使用 -N || true 避免重复打补丁报错)
           cd common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/cve-2026-43499-rtmutex-6.1.patch
           patch -p1 -N -F 3 < cve-2026-43499-rtmutex-6.1.patch || true
@@ -598,12 +591,9 @@ jobs:
         if: inputs.better_net
         run: |
           cd kernel_workspace
-          #启用  BPF 流解析器,实现高性能网络流量处理,增强网络监控和分析能力
           echo "CONFIG_BPF_STREAM_PARSER=y" >> ./common/arch/arm64/configs/gki_defconfig
-          #开启增强 Netfilter 防火墙扩展模块,支持基于地址类型的匹配规则,启用 IP 集合支持,提高防火墙规则灵活性,支持更复杂的流量过滤策略
           echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_NETFILTER_XT_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          #启用 IP 集框架及其多种数据结构实现,提供高效的大规模 IP 地址管理,提高防火墙规则处理效率,减少内存占用
           echo "CONFIG_IP_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_IP_SET_MAX=65534" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_IP_SET_BITMAP_IP=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -622,10 +612,8 @@ jobs:
           echo "CONFIG_IP_SET_HASH_NETPORT=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_IP_SET_HASH_NETIFACE=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_IP_SET_LIST_SET=y" >> ./common/arch/arm64/configs/gki_defconfig
-          #启用 IPv6 网络地址转换
           echo "CONFIG_IP6_NF_NAT=y" >> ./common/arch/arm64/configs/gki_defconfig
           echo "CONFIG_IP6_NF_TARGET_MASQUERADE=y" >> ./common/arch/arm64/configs/gki_defconfig
-          #由于部分机型的vintf兼容性检测规则，在开启CONFIG_IP6_NF_NAT后开机会出现"您的设备内部出现了问题。请联系您的设备制造商了解详情。"的提示，故添加一个配置修复补丁，在编译内核时隐藏CONFIG_IP6_NF_NAT=y但不影响对应功能编译
           cd common
           wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/other_patch/config.patch
           patch -p1 -F 3 < config.patch || true
@@ -635,7 +623,6 @@ jobs:
           if [[ "${{ github.event.inputs.bbr_enable }}" != "false" ]]; then
             echo "正在添加BBR等拥塞控制算法..."
             cd kernel_workspace
-            #开启TCP拥塞控制算法控制器（必需）
             echo "CONFIG_TCP_CONG_ADVANCED=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_TCP_CONG_BBR=y" >> ./common/arch/arm64/configs/gki_defconfig
             echo "CONFIG_TCP_CONG_CUBIC=y" >> ./common/arch/arm64/configs/gki_defconfig
@@ -657,18 +644,14 @@ jobs:
           if [[ "${{ github.event.inputs.droidspaces_enable }}" != "false" ]]; then
             echo "正在启用 Droidspaces 容器支持..."
             cd kernel_workspace/common
-            # 应用 Droidspaces 容器必须补丁
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_sysvipc_kabi_6_7_8.patch
             patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch || true
-            # 修补 oplus_bsp_midas 行为，避免开机崩溃
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/fix_oplus_bsp_midas.patch
             patch -p1 -F 3 < fix_oplus_bsp_midas.patch || true
-            # 应用 NTSync 补丁
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/ntsync_base.patch
             wget https://github.com/$GITHUB_REPOSITORY/raw/refs/heads/$GITHUB_REF_NAME/droidspaces_patch/ntsync_compat_${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch
             patch -p1 -F 3 < ntsync_base.patch || true
             patch -p1 -F 3 < ntsync_compat_${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}.patch || true
-            # 开启 Droidspaces 容器所需内核支持
             echo "CONFIG_PID_NS=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_IPC_NS=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_USER_NS=y" >> ./arch/arm64/configs/gki_defconfig
@@ -679,7 +662,6 @@ jobs:
             echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> ./arch/arm64/configs/gki_defconfig
             echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> ./arch/arm64/configs/gki_defconfig
-            # 开启 NTSync
             echo "CONFIG_NTSYNC=y" >> ./arch/arm64/configs/gki_defconfig
             if [[ "${{ github.event.inputs.droidspaces_enable }}" == "extend" ]]; then
               echo "正在启用容器环境扩展支持..."
@@ -732,7 +714,14 @@ jobs:
             done
           fi
 
-           
+      - name: 集成 NoMount（最新 Release）
+        if: inputs.nomount_enable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          wget -q --tries=3 "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/.github/scripts/setup_nomount_latest.sh" -O /tmp/setup_nomount_latest.sh
+          bash /tmp/setup_nomount_latest.sh "$GITHUB_WORKSPACE/kernel_workspace"
+
       - name: 构建内核
         run: |
           WORKDIR="$(pwd)"
@@ -767,27 +756,23 @@ jobs:
           echo "FAKETIME=$FAKETIME" >> $GITHUB_ENV
           SO_DIR=$(pwd)
           export PRELOAD_LIBS="$SO_DIR/libfakestat.so $SO_DIR/libfaketimeMT.so"
-          #创建 CC (编译器) 包装器
           echo '#!/bin/bash' > cc-wrapper
           echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> cc-wrapper
           echo 'export FAKESTAT="'$FAKESTAT'"' >> cc-wrapper
           echo 'export FAKETIME="'$FAKETIME'"' >> cc-wrapper
           echo 'ccache clang "$@"' >> cc-wrapper
-          #创建 LD (链接器) 包装器
           echo '#!/bin/bash' > ld-wrapper
           echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> ld-wrapper
           echo 'export FAKESTAT="'$FAKESTAT'"' >> ld-wrapper
           echo 'export FAKETIME="'$FAKETIME'"' >> ld-wrapper
           echo 'ld.lld "$@"' >> ld-wrapper
           
-          # 测试时间劫持测试是否正常工作
-          echo "--- [Wrapper Test] 正在创建通用的时间劫持测试脚本 ---"
           echo '#!/bin/bash' > test-wrapper.sh
           echo 'export LD_PRELOAD="'$PRELOAD_LIBS'"' >> test-wrapper.sh
           echo 'export FAKESTAT="'$FAKESTAT'"' >> test-wrapper.sh
           echo 'export FAKETIME="'$FAKETIME'"' >> test-wrapper.sh
           echo 'echo ">>> Wrapper 内部环境检查完毕."' >> test-wrapper.sh
-          echo 'exec "$@"' >> test-wrapper.sh # 执行所有传入的参数
+          echo 'exec "$@"' >> test-wrapper.sh
           chmod +x test-wrapper.sh
           echo "--- [Wrapper Test] 正在测试 (date) 命令 ---"
           ./test-wrapper.sh date
@@ -799,7 +784,6 @@ jobs:
           echo "--- 编译前环境文件时间戳: ---"
           LD_PRELOAD=$PRELOAD_LIBS stat ./Makefile
           
-          #在构建内核的同时清除不必要的.NET, Android NDK, Haskell, CodeQL运行库，清理空间且不阻塞后续步骤运行
           sudo rm -rf /usr/share/dotnet &
           sudo rm -rf /usr/local/lib/android &
           sudo rm -rf /opt/ghc &
@@ -811,7 +795,6 @@ jobs:
           fi
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" HOSTLD=ld.lld O=out KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
           
-          # 二进制硬校验：确认编译生成的 Image 的 __ksymtab_strings 中绝不包含冲突符号 test_task_ux
           if python3 -c 'd=open("out/arch/arm64/boot/Image","rb").read(); exit(0 if b"blk_mq_alloc_request\x00test_task_ux\x00" in d else 1)'; then
             echo "严重错误：Image 的 __ksymtab_strings 中仍然导出了 test_task_ux 符号！终止构建以防开机无限重启！"
             exit 1
@@ -823,7 +806,6 @@ jobs:
           fi
           echo "二进制隐蔽补丁校验通过：Image 包含 jdwp-control、/dev/socket/adbd 与 susfs_is_priority_uid_filtered！"
           
-          # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
           echo "--- 编译后环境文件时间戳: ---"
           LD_PRELOAD=$PRELOAD_LIBS stat ./Makefile
@@ -858,7 +840,6 @@ jobs:
           name: verification-${{ github.run_id }}
           path: ${{ github.workspace }}/verification.txt
           archive: false
-
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
@@ -897,8 +878,6 @@ jobs:
             KSU_TYPENAME="BakaSU-syncup"
           elif [[ "${{ github.event.inputs.ksu_type }}" == "bakasu-main-dev" ]]; then
             KSU_TYPENAME="BakaSU-main"
-          elif [[ "${{ github.event.inputs.ksu_type }}" == "bakasu" ]]; then
-            KSU_TYPENAME="BakaSU"
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
             KSU_TYPENAME="KSUNext"
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksu" ]]; then
@@ -920,7 +899,6 @@ jobs:
           zip -r ../$AK3_NAME ./*
           echo "ak3name=$AK3_NAME" >> $GITHUB_OUTPUT
           
-          #为AK3添加注释（调试信息）
           if [[ -n "${{ github.event.inputs.kernel_suffix }}" ]]; then
             FULL_VERSION=${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}-${{ github.event.inputs.kernel_suffix }}
           else
@@ -959,6 +937,7 @@ jobs:
       - name: 上传 ZIP 工件
         uses: actions/upload-artifact@v7
         with:
+          name: ak3-zip
           path: ${{ github.workspace }}/kernel_workspace/AnyKernel*.zip
           archive: false
 
@@ -974,7 +953,7 @@ jobs:
       - name: 下载 ZIP 工件
         uses: actions/download-artifact@v8
         with:
-          name: ${{ needs.build.outputs.ak3name }}
+          name: ak3-zip
           path: ./release_zips
           skip-decompress: true
 
@@ -997,7 +976,7 @@ jobs:
           echo "TAG_HEAD=$TAG_HEAD" >> $GITHUB_ENV
           if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
             KSU_TYPENAME="SukiSU Ultra"
-          elif [[ ${{ github.event.inputs.ksu_type }} == "bakisu" || ${{ github.event.inputs.ksu_type }} == "bakasu" || ${{ github.event.inputs.ksu_type }} == "bakasu-dev" || ${{ github.event.inputs.ksu_type }} == "bakasu-main-dev" ]]; then
+          elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu-main-dev" ]]; then
             KSU_TYPENAME="BakaSU"
           elif [[ ${{ github.event.inputs.ksu_type }} == "bakasu-sync-up" ]]; then
             KSU_TYPENAME="BakaSU (sync-up)"
@@ -1042,7 +1021,7 @@ jobs:
           
           ### 📋 安装方法 | Installation Guide
           1. 若你的手机已经安装了第三方Recovery（如TWRP)，可下载对应机型的AnyKernel刷机包后进入Recovery模式，通过Recovery刷入刷机包后重启设备；
-          2. 若你的手机之前已有 root 权限，可在手机上安装[HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases)，在HorizonKernelFlasher中刷入AnyKernel刷机包并重启；
+          2. 若你之前已有 root 权限，可在手机上安装[HorizonKernelFlasher](https://github.com/libxzr/HorizonKernelFlasher/releases)，在HorizonKernelFlasher中刷入AnyKernel刷机包并重启；
           3. 若你之前已刷入SukiSU Ultra内核，且SukiSU Ultra管理器已更新至最新版本，可在SukiSU Ultra管理器中直接刷入AnyKernel刷机包并重启；
           4. 刷入无lz4kd补丁版的内核前若刷入过lz4kd补丁版的内核，为避免出错，请先关闭zram模块；
           5. 由于KernelSU上游更新了元模块功能，最新版KSU管理器（包括除KernelSU Next以外的各分支）需要配合元模块(metamodule)才能正常挂载模块。目前的元模块包括[meta overlayfs](https://github.com/KernelSU-Modules-Repo/meta-overlayfs), [mountify](https://github.com/backslashxx/mountify), [meta magicmount](https://github.com/7a72/meta-magic_mount/), [meta magicmount rs](https://github.com/Tools-cx-app/meta-magic_mount/), [hybrid mount](https://github.com/YuzakiKokuban/meta-hybrid_mount)等。若你是第一次使用KSU或刚从旧版KSU管理器升级至新版，请先安装一个元模块，这样其他涉及系统挂载的模块才能正常运行；
