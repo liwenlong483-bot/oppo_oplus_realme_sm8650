@@ -282,51 +282,25 @@ jobs:
         run: |
           # 进入内核工作目录
           cd kernel_workspace
-          if [[ "${{ github.event.inputs.ksu_type }}" == "sukisu" || "${{ github.event.inputs.ksu_type }}" == "bakasu" || "${{ github.event.inputs.ksu_type }}" == "bakasu-main-dev" ]]; then
-            echo "正在配置BakaSU (main/dev，由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu)..."
+          if [[ ${{ github.event.inputs.ksu_type }} == "bakasu" ]]; then
+            echo "正在配置BakaSU（由于SukiSU长期未维护无法正常编译，且BakaSU兼容sukisu管理器，故SukiSU源码仓库已重定向为bakasu）..."
             curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/main/kernel/setup.sh" | bash -s main
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
-            # 修复 BakaSU 上游 commit fa12ffde8244 误删 <6.6 SUSFS 所需的 fake_state 定义与初始化（解决链接时 undefined symbol: fake_state 报错）
-            sed -i '/__maybe_static struct page \*fake_status = NULL;/a #if defined(KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE) \&\& LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)\nstruct selinux_state fake_state;\n#endif' kernel/feature/selinux_hide.c
-            sed -i '/no backup sepolicy available/{n;n;a #if defined(KSU_COMPAT_HAS_SUSFS_FEATURE_SELINUX_HIDE) \&\& LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)\n    fake_state.initialized = true;\n    fake_state.policy = backup_sepolicy;\n#endif
-            }' kernel/feature/selinux_hide.c
-            # 为 main 分支同步补充 KSU_SUSFS_PRIORITY_UID_FILTER 支持
-            if ! grep -q "KSU_SUSFS_PRIORITY_UID_FILTER" kernel/Kconfig; then
-              sed -i '/config KSU_SUSFS_SUS_MAP/i config KSU_SUSFS_PRIORITY_UID_FILTER\n    bool "Enable priority uid filter"\n    depends on KSU_SUSFS\n    default y\n' kernel/Kconfig
-            fi
-            if ! grep -q "CMD_SUSFS_SET_PRIORITY_UID_FILTER" kernel/supercall/dispatch.c; then
-              sed -i '/case CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING:/i #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n    case CMD_SUSFS_SET_PRIORITY_UID_FILTER: {\n        susfs_set_priority_uid_filter(arg);\n        return 0;\n    }\n#endif' kernel/supercall/dispatch.c
-            fi
-            if ! grep -q "susfs_parse_priority_app_strings" kernel/manager/throne_tracker.c; then
-              sed -i '/#include <linux\/kernel.h>/a #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n#include <linux/susfs.h>\n#endif' kernel/manager/throne_tracker.c
-              sed -i '/revert_creds(old_cred);/a #ifdef CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n    susfs_parse_priority_app_strings();\n#endif' kernel/manager/throne_tracker.c
-            fi
-            sed -i 's/-dirty//g' kernel/Kbuild
             # 生成自定义版本号（基于提交计数）, 失败时使用 114514
             KSU_VERSION=$(expr $(git rev-list --count main) + 30700 2>/dev/null || echo 114514)
             # 存储版本号到 GitHub 环境变量
             echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
             echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.event.inputs.ksu_type }}" == "bakasu-sync-up" ]]; then
-            echo "正在配置BakaSU (sync-up分支)..."
-            curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/refs/heads/sync-up/kernel/setup.sh" | bash -s sync-up
+          elif [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
+            echo "正在配置 SukiSU Nova（官方仓库）..."
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" | bash -s builtin
             echo 'CONFIG_KSU_FULL_NAME_FORMAT="%TAG_NAME%-%COMMIT_SHA%@cctv18"' >> ./common/arch/arm64/configs/gki_defconfig
             cd ./KernelSU
-            # 补充 sync-up 分支 Kconfig 中缺失的 KSU_SUSFS_PRIORITY_UID_FILTER 配置项定义
-            if ! grep -q "KSU_SUSFS_PRIORITY_UID_FILTER" kernel/Kconfig; then
-              sed -i '/config KSU_SUSFS_SUS_MAP/i config KSU_SUSFS_PRIORITY_UID_FILTER\n    bool "Enable priority uid filter"\n    depends on KSU_SUSFS\n    default y\n' kernel/Kconfig
-            fi
-            # 确保 preinit_runner.mk 在解析编译器头文件目录时直接调用 clang，避免通过 cc-wrapper / ccache 包装器干扰
-            if [ -f kernel/tools/code_generation/preinit_runner/preinit_runner.mk ]; then
-              sed -i 's/\$(CC) -print-file-name=include/clang -print-file-name=include/g' kernel/tools/code_generation/preinit_runner/preinit_runner.mk
-            fi
-            sed -i 's/-dirty//g' kernel/Kbuild
-            # 生成自定义版本号（基于提交计数）, 失败时使用 114514
-            KSU_VERSION=$(expr $(git rev-list --count HEAD) + 30700 2>/dev/null || echo 114514)
-            # 存储版本号到 GitHub 环境变量
-            echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-            echo "ksuver=$KSU_VERSION" >> $GITHUB_OUTPUT
+            KSU_VERSION=${{ env.SUKISU_CI_VERSION }}
+            KSU_UAPI_VERSION=${{ env.SUKISU_CI_UAPI }}
+            echo "KSUVER=${KSU_VERSION}-${KSU_UAPI_VERSION}" >> $GITHUB_ENV
+            echo "ksuver=${KSU_VERSION}-${KSU_UAPI_VERSION}" >> $GITHUB_OUTPUT
           elif [[ ${{ github.event.inputs.ksu_type }} == "ksunext" ]]; then
             echo "正在配置KernelSU Next..."
             curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/refs/heads/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
@@ -353,6 +327,7 @@ jobs:
           else
             echo "已选择无内置KernelSU模式，跳过KernelSU配置..."
           fi
+
 
       - name: 应用 KernelSU & SUSFS 补丁
         if: inputs.susfs_enable
