@@ -328,6 +328,64 @@ jobs:
             echo "已选择无内置KernelSU模式，跳过KernelSU配置..."
           fi
 
+      - name: 默认启用 SELinux 隐藏
+        run: |
+          cd kernel_workspace
+          python3 - <<'PY'
+          p = 'common/drivers/kernelsu/feature/selinux_hide.c'
+          s = open(p).read()
+          marker = 'void ksu_selinux_hide_handle_post_fs_data()\n{\n'
+          if marker not in s:
+              raise SystemExit('selinux_hide post_fs_data pattern not found')
+          if 'auto-enable' not in s:
+              code = (
+                  '\tif (!ksu_selinux_hide_running) {\n'
+                  '\t\tint ret = selinux_hide_feature_set(1);\n'
+                  '\t\tif (ret)\n'
+                  '\t\t\tpr_warn("selinux_hide: auto-enable failed: %d\\n", ret);\n'
+                  '\t}\n'
+              )
+              s = s.replace(marker, 'static int selinux_hide_feature_set(u64 value);\n\n' + marker, 1)
+              s = s.replace(marker, marker + code, 1)
+              open(p, 'w').write(s)
+          PY
+          grep -n 'auto-enable' common/drivers/kernelsu/feature/selinux_hide.c
+      - name: 对齐 SELinux access/status seqno
+        run: |
+          cd kernel_workspace
+          python3 - <<'PY'
+          import os
+          hide = 'common/drivers/kernelsu/feature/selinux_hide.c'
+          s = open(hide).read()
+          old = 'memcpy(new_status, status, sizeof(*status));'
+          if old in s and 'new_status->policyload = 1;' not in s:
+              s = s.replace(old, old + '\n    new_status->policyload = 1;', 1)
+              open(hide, 'w').write(s)
+          fs = 'common/security/selinux/selinuxfs.c'
+          s = open(fs).read()
+          old = 'susfs_security_compute_av_user(ssid, tsid, tclass, &avd);'
+          if old in s and 'avd.seqno = 1;' not in s:
+              s = s.replace(old, old + '\n\tavd.seqno = 1;', 1)
+              open(fs, 'w').write(s)
+          print('seqno aligned')
+          PY
+          grep -n 'new_status->policyload = 1' common/drivers/kernelsu/feature/selinux_hide.c
+          grep -n 'avd.seqno = 1' common/security/selinux/selinuxfs.c || true
+
+      - name: 固定 SukiSU CI 版本号
+        if: inputs.ksu_type == 'sukisu'
+        run: |
+          cd kernel_workspace
+          python3 - <<'PY'
+          import os, re
+          for p in ('common/drivers/kernelsu/Kbuild', 'common/drivers/kernelsu/Makefile'):
+              if os.path.exists(p):
+                  s = open(p).read()
+                  s = re.sub(r'^KSU_VERSION\s*:=.*$', 'KSU_VERSION := 35070', s, flags=re.M)
+                  open(p, 'w').write(s)
+          PY
+          grep -R '^KSU_VERSION' common/drivers/kernelsu/Kbuild common/drivers/kernelsu/Makefile 2>/dev/null | head
+
 
       - name: 应用 KernelSU & SUSFS 补丁
         if: inputs.susfs_enable
@@ -335,7 +393,7 @@ jobs:
           cd kernel_workspace
           if [[ ${{ github.event.inputs.ksu_type }} != "none" ]]; then
             echo "正在添加susfs补丁..."
-            if [[ ${{ github.event.inputs.ksu_type }} == "bakasu-sync-up" ]]; then
+            if [[ ${{ github.event.inputs.ksu_type }} == "sukisu" ]]; then
               git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu -b gki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
             else
               git clone --depth=1 https://github.com/cctv18/susfs4oki.git susfs4ksu -b oki-${{ env.ANDROID_VERSION }}-${{ env.KERNEL_VERSION }}
@@ -374,6 +432,88 @@ jobs:
             cd ./KernelSU
             patch -p1 -F 3 < 10_enable_susfs_for_ksu.patch || true
           fi
+
+     - name: 隐藏 SELinux policy dump
+        if: inputs.susfs_enable && inputs.ksu_type != 'none'
+        run: |
+          cd kernel_workspace
+          python3 - <<'PY'
+          import os
+          # 1) 在 services.c 暴露一个“按指定 policy 序列化”的 helper
+          svc = 'common/security/selinux/ss/services.c'
+          s = open(svc).read()
+          if 'security_read_policy_from' not in s:
+              marker = 'int security_read_policy('
+              if marker not in s:
+                  raise SystemExit('security_read_policy marker not found')
+              helper = (
+                  'int security_read_policy_from(struct selinux_policy *policy, void **data, size_t *len)\n'
+                  '{\n'
+                  '\tint rc;\n'
+                  '\n'
+                  '\tif (!policy || !data || !len)\n'
+                  '\t\treturn -EINVAL;\n'
+                  '\t*len = policy->policydb.len;\n'
+                  '\t*data = vmalloc_user(*len);\n'
+                  '\tif (!*data)\n'
+                  '\t\treturn -ENOMEM;\n'
+                  '\trc = __security_read_policy(policy, *data, len);\n'
+                  '\tif (rc) {\n'
+                  '\t\tvfree(*data);\n'
+                  '\t\t*data = NULL;\n'
+                  '\t\t*len = 0;\n'
+                  '\t}\n'
+                  '\treturn rc;\n'
+                  '}\n\n'
+              )
+              s = s.replace(marker, helper + marker, 1)
+              open(svc, 'w').write(s)
+          # 2) selinuxfs 打开 policy 时，普通应用改用 backup policy
+          fs = 'common/security/selinux/selinuxfs.c'
+          s = open(fs).read()
+          if 'ksu_selinux_hide_is_running' not in s:
+              marker = 'static int sel_open_policy'
+              if marker not in s:
+                  raise SystemExit('sel_open_policy marker not found')
+              decl = (
+                  '#ifdef CONFIG_KSU\n'
+                  'extern struct selinux_policy *backup_sepolicy;\n'
+                  'extern bool ksu_selinux_hide_is_running(void);\n'
+                  'extern int security_read_policy_from(struct selinux_policy *policy, void **data, size_t *len);\n'
+                  '#endif\n\n'
+              )
+              s = s.replace(marker, decl + marker, 1)
+              open(fs, 'w').write(s)
+          s = open(fs).read()
+          if 'security_read_policy_from(backup_sepolicy' not in s:
+              old1 = 'rc = security_read_policy(state, &plm->data, &plm->len);'
+              old2 = 'rc = security_read_policy(&plm->data, &plm->len);'
+              if old1 in s:
+                  old = old1
+              elif old2 in s:
+                  old = old2
+              else:
+                  raise SystemExit('security_read_policy call not found')
+              new = (
+                  '#ifdef CONFIG_KSU\n'
+                  '\tif (current_uid().val >= 10000 && ksu_selinux_hide_is_running() && backup_sepolicy)\n'
+                  '\t\trc = security_read_policy_from(backup_sepolicy, &plm->data, &plm->len);\n'
+                  '\telse\n'
+                  '#endif\n'
+                  '\t\t' + old
+              )
+              s = s.replace('\t' + old, new, 1)
+              open(fs, 'w').write(s)
+          # 3) 暴露 hide running 状态
+          hide = 'common/drivers/kernelsu/feature/selinux_hide.c'
+          s = open(hide).read()
+          if 'ksu_selinux_hide_is_running' not in s:
+              s = s.rstrip() + '\n\nbool ksu_selinux_hide_is_running(void)\n{\n\treturn ksu_selinux_hide_running;\n}\n'
+              open(hide, 'w').write(s)
+          print('policy dump hide patched')
+          PY
+          grep -n 'security_read_policy_from' common/security/selinux/ss/services.c common/security/selinux/selinuxfs.c
+          grep -n 'ksu_selinux_hide_is_running' common/drivers/kernelsu/feature/selinux_hide.c
           
       - name: 应用lz4 1.10.0 & zstd 1.5.7补丁
         if: inputs.lz4_enable
@@ -591,6 +731,15 @@ jobs:
               sed -i "\$s|echo \"\\\$res\"|echo \"-${{ env.KERNEL_NAME }}\"|" "$f"
             done
           fi
+
+      - name: 集成 NoMount（最新 Release）
+        if: inputs.nomount_enable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          wget -q --tries=3 "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/.github/scripts/setup_nomount_latest.sh" -O /tmp/setup_nomount_latest.sh
+          bash /tmp/setup_nomount_latest.sh "$GITHUB_WORKSPACE/kernel_workspace"
+
            
       - name: 构建内核
         run: |
@@ -691,6 +840,33 @@ jobs:
           ccache -s
           echo "编译后空间:"
           df -h
+
+      - name: 校验 NoMount 与功能配置
+        if: always()
+        env:
+          NOMOUNT_ENABLE: ${{ inputs.nomount_enable }}
+          KSU_TYPE: ${{ inputs.ksu_type }}
+          SUSFS_ENABLE: ${{ inputs.susfs_enable }}
+          KPM_ENABLE: ${{ inputs.kpm_enable }}
+          LZ4_ENABLE: ${{ inputs.lz4_enable }}
+          LZ4KD_ENABLE: ${{ inputs.lz4kd_enable }}
+          BBR_ENABLE: ${{ inputs.bbr_enable }}
+          DROIDSPACES_ENABLE: ${{ inputs.droidspaces_enable }}
+          SSG_ENABLE: ${{ inputs.ssg_enable || 'false' }}
+          ADIOS_ENABLE: ${{ inputs.adios_enable || 'false' }}
+          REKERNEL_ENABLE: ${{ inputs.rekernel_enable }}
+          BASEBAND_GUARD: ${{ inputs.baseband_guard }}
+        run: |
+          wget -q --tries=3 "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/.github/scripts/verify_nomount_features.sh" -O /tmp/verify_nomount_features.sh
+          bash /tmp/verify_nomount_features.sh "$GITHUB_WORKSPACE/kernel_workspace" "$NOMOUNT_ENABLE" "$GITHUB_WORKSPACE/verification.txt"
+      - name: 上传校验报告
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: verification-${{ github.run_id }}
+          path: ${{ github.workspace }}/verification.txt
+          archive: false
+
 
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
@@ -864,7 +1040,7 @@ jobs:
           - Re-Kernel支持：${{ github.event.inputs.rekernel_enable }}
           - 内核级基带保护支持：${{ github.event.inputs.baseband_guard }}
           - BakaSU管理器下载：[BakaSU_CI](https://github.com/cctv18/BakaSU_CI/releases)
-          - SukiSU Ultra管理器下载：[SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra/releases)
+          - SukiSU Nova管理器下载：[SukiSU-Nova](https://github.com/SukiSU-Nova/SukiSU-Nova/releases)
           - KernelSU Next管理器下载：[KernelSU-Next](https://github.com/KernelSU-Next/KernelSU-Next/releases)
           - KSU原版管理器下载：[KernelSU](https://github.com/tiann/KernelSU/releases)
           
